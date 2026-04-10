@@ -176,9 +176,15 @@ class OrderReplyApp:
 
 
 def main():
-    root = tk.Tk()
-    app = OrderReplyApp(root)
-    root.mainloop()
+    try:
+        root = tk.Tk()
+        app = OrderReplyApp(root)
+        print("GUI 창이 열립니다. 창이 보이지 않으면 작업 표시줄을 확인하세요.")
+        root.mainloop()
+    except Exception as e:
+        print(f"GUI 실행 중 오류 발생: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

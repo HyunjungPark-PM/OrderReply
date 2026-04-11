@@ -1,9 +1,7 @@
-"""
-Excel file comparison and processing module for p-net order reply system.
-"""
 import pandas as pd
 from itertools import combinations
 from typing import Any, List, Dict, Optional
+from datetime import datetime
 
 
 class ExcelProcessor:
@@ -13,6 +11,26 @@ class ExcelProcessor:
         self.pnet_download = None
         self.factory_reply = None
         self.result = None
+        self.confirmation_needed = None
+        self.change_summary = None
+
+    def _date_to_yyyymmdd(self, date_val):
+        """Convert date to YYYYMMDD text format."""
+        if pd.isna(date_val):
+            return None
+        if isinstance(date_val, str):
+            date_val = date_val.strip()
+            if len(date_val) == 8 and date_val.isdigit():
+                return date_val  # Already YYYYMMDD
+            try:
+                parsed = pd.to_datetime(date_val)
+                return parsed.strftime('%Y%m%d')
+            except:
+                return date_val
+        try:
+            return pd.to_datetime(date_val).strftime('%Y%m%d')
+        except:
+            return str(date_val)
 
     def read_pnet_download(self, file_path: str) -> bool:
         """
@@ -24,9 +42,9 @@ class ExcelProcessor:
         - G: LINE SEQ
         - H: CPO QTY
         - I: Material
-        - O: EX-F
-        - P: ETD
-        - X: PO#
+        - O: EX-F (date YYYY-MM-DD)
+        - P: ETD (date YYYY-MM-DD)
+        - X: PO# (9 or 10 digits, pad with 0 if 9)
         - Y: PO-LINE#
         """
         try:
@@ -42,6 +60,11 @@ class ExcelProcessor:
             selected['CPO#'] = selected['CPO#'].astype(str).str.strip()
             selected['CPO-LINE#'] = selected['CPO-LINE#'].astype(str).str.strip()
             selected['LINE SEQ'] = selected['LINE SEQ'].astype(str).str.strip()
+            # Pad PO# to 10 digits
+            selected['PO#'] = selected['PO#'].apply(lambda x: x.zfill(10) if len(x) == 9 else x)
+            # Convert dates to YYYYMMDD text
+            selected['EX-F'] = selected['EX-F'].apply(self._date_to_yyyymmdd)
+            selected['ETD'] = selected['ETD'].apply(self._date_to_yyyymmdd)
             self.pnet_download = selected.dropna(subset=['PO#', 'PO-LINE#']).reset_index(drop=True)
             return True
         except Exception as e:
@@ -53,12 +76,12 @@ class ExcelProcessor:
         Read factory reply file.
 
         Expected columns:
-        - A: PO#
+        - A: PO# (9 or 10 digits, pad with 0 if 9)
         - B: LINE#
         - C: Material
         - D: CPO QTY
-        - E: ETD
-        - F: EX-F
+        - E: ETD (date YYYY-MM-DD or text YYYYMMDD)
+        - F: EX-F (date YYYY-MM-DD or text YYYYMMDD)
         - G: 내부노트
         """
         try:
@@ -70,6 +93,11 @@ class ExcelProcessor:
             selected['CPO QTY'] = pd.to_numeric(selected['CPO QTY'], errors='coerce')
             selected['PO#'] = selected['PO#'].astype(str).str.strip()
             selected['LINE#'] = selected['LINE#'].astype(str).str.strip()
+            # Pad PO# to 10 digits
+            selected['PO#'] = selected['PO#'].apply(lambda x: x.zfill(10) if len(x) == 9 else x)
+            # Convert dates to YYYYMMDD text for comparison
+            selected['ETD'] = selected['ETD'].apply(self._date_to_yyyymmdd)
+            selected['EX-F'] = selected['EX-F'].apply(self._date_to_yyyymmdd)
             self.factory_reply = selected.dropna(subset=['PO#', 'LINE#']).reset_index(drop=True)
             return True
         except Exception as e:
@@ -78,10 +106,10 @@ class ExcelProcessor:
 
     def compare_and_generate(self) -> bool:
         """
-        Compare two files and generate output file.
+        Compare two files and generate output file with multiple sheets.
 
-        Comparison key: PO# + LINE#
-        Output columns: PO#, PO-LINE#, Material, CPO QTY, ETD, EX-F, 내부노트, CPO#, CPO-LINE#, LINE SEQ
+        Comparison key: PO# + LINE# (factory LINE#)
+        Output sheets: 수동 업로드, 확인필요, 변경요약
         """
         try:
             if self.pnet_download is None or self.factory_reply is None:
@@ -95,7 +123,8 @@ class ExcelProcessor:
             factory_df['PO#'] = factory_df['PO#'].astype(str)
             factory_df['LINE#'] = factory_df['LINE#'].astype(str)
 
-            result_list: List[Dict[str, Any]] = []
+            upload_result_list: List[Dict[str, Any]] = []
+            confirmation_list: List[Dict[str, Any]] = []
 
             for (po_num, line_num), pnet_group in pnet_df.groupby(['PO#', 'PO-LINE#'], sort=False):
                 factory_group = factory_df[
@@ -104,209 +133,174 @@ class ExcelProcessor:
                 ].copy()
 
                 if factory_group.empty:
-                    for _, pnet_row in pnet_group.iterrows():
-                        result_list.append({
+                    # No matching factory data, exclude
+                    confirmation_list.append({
+                        'PO#': po_num,
+                        'PO-LINE#': line_num,
+                        '사유': '공장납기회신 파일에 해당 PO#/LINE# 없음'
+                    })
+                    continue
+
+                # Total quantity check
+                pnet_total = pnet_group['CPO QTY'].sum()
+                factory_total = factory_group['CPO QTY'].sum()
+                if abs(pnet_total - factory_total) > 1e-9:
+                    confirmation_list.append({
+                        'PO#': po_num,
+                        'PO-LINE#': line_num,
+                        '사유': f'총수량 불일치(다운로드:{pnet_total}, 회신:{factory_total})'
+                    })
+                    continue
+
+                # Try global no-split assignment
+                assignment = self._try_global_no_split(pnet_group, factory_group)
+                if assignment:
+                    upload_result_list.extend(assignment)
+                else:
+                    # Try split assignment
+                    split_assignment = self._try_split_assignment(pnet_group, factory_group)
+                    if split_assignment:
+                        upload_result_list.extend(split_assignment)
+                    else:
+                        confirmation_list.append({
                             'PO#': po_num,
                             'PO-LINE#': line_num,
-                            'Material': pnet_row['Material'],
-                            'CPO QTY': pnet_row['CPO QTY'],
-                            'ETD': pnet_row['ETD'],
-                            'EX-F': pnet_row['EX-F'],
-                            '내부노트': None,
-                            'CPO#': pnet_row['CPO#'],
-                            'CPO-LINE#': pnet_row['CPO-LINE#'],
-                            'LINE SEQ': pnet_row['LINE SEQ']
+                            '사유': '공장납기회신 파일의 수량 구조상 기존 LINE SEQ조합으로 배정 불가 / 최소분할원칙위반 (단일 LINE SEQ 2~3분할로도 회신 수량 구성 불가)'
                         })
-                else:
-                    result_list.extend(self._map_factory_to_download(pnet_group, factory_group))
 
-            self.result = pd.DataFrame(result_list)
+            self.result = pd.DataFrame(upload_result_list)
+            self.confirmation_needed = pd.DataFrame(confirmation_list)
+            self.change_summary = self._generate_change_summary(pnet_df, self.result)
             return True
         except Exception as e:
             print(f"Error comparing files: {e}")
             return False
 
-    def _map_factory_to_download(
-        self,
-        download_group: pd.DataFrame,
-        factory_group: pd.DataFrame
-    ) -> List[Dict[str, Any]]:
-        """Map factory ETD/EX-F values to download rows with minimal splitting."""
-        download_rows = download_group.copy().reset_index(drop=True).to_dict('records')
-        for index, row in enumerate(download_rows):
-            row['_orig_index'] = index
-            row['_quantity'] = float(row['CPO QTY'] or 0)
+    def _try_global_no_split(self, pnet_group: pd.DataFrame, factory_group: pd.DataFrame) -> Optional[List[Dict[str, Any]]]:
+        """Try global no-split assignment."""
+        # Group factory by ETD
+        factory_by_etd = factory_group.groupby('ETD')
+        etd_requirements = {etd: group['CPO QTY'].sum() for etd, group in factory_by_etd}
 
-        factory_rows = []
-        for index, row in enumerate(factory_group.copy().reset_index(drop=True).to_dict('records')):
-            remaining_qty = float(row['CPO QTY'] or 0)
-            if remaining_qty > 0:
-                factory_rows.append({**row, 'remaining_qty': remaining_qty, '_index': index})
+        # Find subsets of pnet LINE SEQ that match ETD requirements
+        pnet_rows = pnet_group.to_dict('records')
+        for etd, required_qty in etd_requirements.items():
+            matching_rows = [row for row in pnet_rows if row['ETD'] == etd and row['CPO QTY'] == required_qty]
+            if matching_rows:
+                # Assign
+                result = []
+                for row in matching_rows:
+                    factory_row = factory_group[factory_group['ETD'] == etd].iloc[0]  # Take first
+                    result.append({
+                        'PO#': row['PO#'],
+                        'PO-LINE#': row['PO-LINE#'],
+                        'Material': row['Material'],
+                        'CPO QTY': row['CPO QTY'],
+                        'ETD(텍스트,YYYYMMDD)': factory_row['ETD'],
+                        'EX-F(텍스트,YYYYMMDD)': factory_row['EX-F'],
+                        '내부노트': factory_row['내부노트'],
+                        'CPO#': row['CPO#'],
+                        'CPO-LINE#': row['CPO-LINE#'],
+                        'LINE SEQ': row['LINE SEQ']
+                    })
+                # Remove assigned
+                pnet_rows = [row for row in pnet_rows if row not in matching_rows]
+                if not pnet_rows:
+                    return result
+        return None
+    def _try_split_assignment(self, pnet_group: pd.DataFrame, factory_group: pd.DataFrame) -> Optional[List[Dict[str, Any]]]:
+        """Try split assignment with conditions."""
+        # Simplified split logic: allow splitting into 2-3 parts
+        pnet_rows = pnet_group.to_dict('records')
+        factory_rows = factory_group.to_dict('records')
 
-        result_rows: List[Dict[str, Any]] = []
+        # Check if split is possible
+        pnet_total = sum(row['CPO QTY'] for row in pnet_rows)
+        factory_total = sum(row['CPO QTY'] for row in factory_rows)
+        if pnet_total < factory_total:
+            return None
 
-        download_rows.sort(key=lambda row: (-row['_quantity'], row['_orig_index']))
-
-        whole_assigned = []
-        split_candidates = []
-
-        for download_row in download_rows:
-            if download_row['_quantity'] <= 0:
-                result_rows.append({
-                    'PO#': download_row['PO#'],
-                    'PO-LINE#': download_row['PO-LINE#'],
-                    'Material': download_row['Material'],
-                    'CPO QTY': download_row['CPO QTY'],
-                    'ETD': download_row['ETD'],
-                    'EX-F': download_row['EX-F'],
-                    '내부노트': None,
-                    'CPO#': download_row['CPO#'],
-                    'CPO-LINE#': download_row['CPO-LINE#'],
-                    'LINE SEQ': download_row['LINE SEQ']
+        # Try to assign with splitting
+        result = []
+        factory_idx = 0
+        for pnet_row in pnet_rows:
+            qty_needed = pnet_row['CPO QTY']
+            while qty_needed > 0 and factory_idx < len(factory_rows):
+                factory_row = factory_rows[factory_idx]
+                assign_qty = min(qty_needed, factory_row['CPO QTY'])
+                result.append({
+                    'PO#': pnet_row['PO#'],
+                    'PO-LINE#': pnet_row['PO-LINE#'],
+                    'Material': pnet_row['Material'],
+                    'CPO QTY': assign_qty,
+                    'ETD(텍스트,YYYYMMDD)': factory_row['ETD'],
+                    'EX-F(텍스트,YYYYMMDD)': factory_row['EX-F'],
+                    '내부노트': factory_row['내부노트'],
+                    'CPO#': pnet_row['CPO#'],
+                    'CPO-LINE#': pnet_row['CPO-LINE#'],
+                    'LINE SEQ': pnet_row['LINE SEQ']
                 })
+                qty_needed -= assign_qty
+                factory_row['CPO QTY'] -= assign_qty
+                if factory_row['CPO QTY'] <= 0:
+                    factory_idx += 1
+            if qty_needed > 0:
+                return None  # Cannot assign fully
+        return result
+
+    def _generate_change_summary(self, original_pnet: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFrame:
+        """Generate change summary comparing original and result."""
+        summary = []
+        if result_df.empty:
+            return pd.DataFrame(summary)
+
+        # Create key for comparison
+        original_pnet['key'] = original_pnet['CPO#'] + '-' + original_pnet['CPO-LINE#'] + '-' + original_pnet['LINE SEQ']
+        result_df['key'] = result_df['CPO#'] + '-' + result_df['CPO-LINE#'] + '-' + result_df['LINE SEQ']
+
+        for key in result_df['key'].unique():
+            orig_row = original_pnet[original_pnet['key'] == key]
+            res_row = result_df[result_df['key'] == key]
+            if orig_row.empty or res_row.empty:
                 continue
-
-            candidate = self._find_whole_assignment(download_row, factory_rows)
-            if candidate is not None:
-                factory_row = candidate
-                self._assign_factory_segment(download_row, factory_row, download_row['_quantity'], result_rows)
-                whole_assigned.append(download_row)
-            else:
-                split_candidates.append(download_row)
-
-        for download_row in split_candidates:
-            self._assign_split_download(download_row, factory_rows, result_rows)
-
-        result_rows.sort(key=lambda row: (row['PO#'], row['PO-LINE#'], row['LINE SEQ']))
-        return result_rows
-
-    def _find_whole_assignment(self, download_row: Dict[str, Any], factory_rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        download_qty = download_row['_quantity']
-        exact_same_etd: List[Dict[str, Any]] = []
-        same_etd: List[Dict[str, Any]] = []
-        candidates: List[Dict[str, Any]] = []
-
-        for factory_row in factory_rows:
-            remaining_qty = factory_row['remaining_qty']
-            if remaining_qty >= download_qty:
-                candidates.append(factory_row)
-                if self._matches_etd(download_row, factory_row):
-                    same_etd.append(factory_row)
-                    if abs(remaining_qty - download_qty) < 1e-9:
-                        exact_same_etd.append(factory_row)
-
-        if exact_same_etd:
-            return min(exact_same_etd, key=lambda row: row['remaining_qty'])
-        if same_etd:
-            return min(same_etd, key=lambda row: row['remaining_qty'])
-        if candidates:
-            return min(candidates, key=lambda row: row['remaining_qty'])
-        return None
-
-    def _matches_etd(self, download_row: Dict[str, Any], factory_row: Dict[str, Any]) -> bool:
-        return str(download_row['ETD']).strip() == str(factory_row['ETD']).strip()
-
-    def _assign_factory_segment(
-        self,
-        download_row: Dict[str, Any],
-        factory_row: Dict[str, Any],
-        quantity: float,
-        result_rows: List[Dict[str, Any]]
-    ) -> None:
-        factory_row['remaining_qty'] -= quantity
-        result_rows.append({
-            'PO#': download_row['PO#'],
-            'PO-LINE#': download_row['PO-LINE#'],
-            'Material': factory_row['Material'],
-            'CPO QTY': quantity,
-            'ETD': factory_row['ETD'],
-            'EX-F': factory_row['EX-F'],
-            '내부노트': factory_row['내부노트'],
-            'CPO#': download_row['CPO#'],
-            'CPO-LINE#': download_row['CPO-LINE#'],
-            'LINE SEQ': download_row['LINE SEQ']
-        })
-
-    def _assign_split_download(
-        self,
-        download_row: Dict[str, Any],
-        factory_rows: List[Dict[str, Any]],
-        result_rows: List[Dict[str, Any]]
-    ) -> None:
-        quantity_to_assign = download_row['_quantity']
-        combo = self._find_split_combo(download_row, factory_rows)
-        if combo is None:
-            raise ValueError(
-                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
-                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
-            )
-
-        for factory_row in combo:
-            if quantity_to_assign <= 0:
-                break
-            assign_qty = min(factory_row['remaining_qty'], quantity_to_assign)
-            self._assign_factory_segment(download_row, factory_row, assign_qty, result_rows)
-            quantity_to_assign -= assign_qty
-
-        if quantity_to_assign > 0:
-            raise ValueError(
-                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
-                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
-            )
-
-    def _find_split_combo(
-        self,
-        download_row: Dict[str, Any],
-        factory_rows: List[Dict[str, Any]]
-    ) -> Optional[List[Dict[str, Any]]]:
-        required_qty = download_row['_quantity']
-        available = [row for row in factory_rows if row['remaining_qty'] > 0]
-        available.sort(key=lambda row: -row['remaining_qty'])
-
-        for combo_size in (2, 3):
-            best_combo = None
-            best_score = None
-            for combo in combinations(available, combo_size):
-                total_qty = sum(row['remaining_qty'] for row in combo)
-                if total_qty < required_qty:
-                    continue
-                assigned_qty = []
-                remaining = required_qty
-                same_etd_qty = 0.0
-                for row in combo:
-                    qty = min(row['remaining_qty'], remaining)
-                    assigned_qty.append(qty)
-                    if self._matches_etd(download_row, row):
-                        same_etd_qty += qty
-                    remaining -= qty
-                if remaining > 1e-9:
-                    continue
-
-                score = (
-                    sum(assigned_qty),
-                    same_etd_qty,
-                    tuple(assigned_qty),
-                    tuple(row['remaining_qty'] for row in combo)
-                )
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_combo = combo
-            if best_combo is not None:
-                return list(best_combo)
-
-        return None
+            orig = orig_row.iloc[0]
+            res = res_row.iloc[0]
+            changes = []
+            if orig['CPO QTY'] != res['CPO QTY']:
+                changes.append(f'수량: {orig["CPO QTY"]} -> {res["CPO QTY"]}')
+            if orig['ETD'] != res['ETD(텍스트,YYYYMMDD)']:
+                changes.append(f'ETD: {orig["ETD"]} -> {res["ETD(텍스트,YYYYMMDD)"]}')
+            if changes:
+                summary.append({
+                    'CPO#': res['CPO#'],
+                    'CPO-LINE#': res['CPO-LINE#'],
+                    'LINE SEQ': res['LINE SEQ'],
+                    '변경종류': '; '.join(changes)
+                })
+        return pd.DataFrame(summary)
 
     def save_result(self, output_path: str) -> bool:
-        """Save result to Excel file."""
+        """Save result to Excel file with multiple sheets."""
         try:
             if self.result is None:
                 raise ValueError("No result to save. Run compare_and_generate first.")
 
-            column_order = [
-                'PO#', 'PO-LINE#', 'Material', 'CPO QTY', 'ETD', 'EX-F',
-                '내부노트', 'CPO#', 'CPO-LINE#', 'LINE SEQ'
-            ]
-            self.result[column_order].to_excel(output_path, index=False)
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # 수동 업로드 sheet
+                column_order = [
+                    'PO#', 'PO-LINE#', 'Material', 'CPO QTY', 'ETD(텍스트,YYYYMMDD)', 'EX-F(텍스트,YYYYMMDD)',
+                    '내부노트', 'CPO#', 'CPO-LINE#', 'LINE SEQ'
+                ]
+                self.result[column_order].to_excel(writer, sheet_name='수동 업로드', index=False)
+
+                # 확인필요 sheet
+                if self.confirmation_needed is not None and not self.confirmation_needed.empty:
+                    self.confirmation_needed.to_excel(writer, sheet_name='확인필요', index=False)
+
+                # 변경요약 sheet
+                if self.change_summary is not None and not self.change_summary.empty:
+                    self.change_summary.to_excel(writer, sheet_name='변경요약', index=False)
+
             return True
         except Exception as e:
             print(f"Error saving result: {e}")

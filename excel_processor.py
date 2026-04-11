@@ -243,8 +243,8 @@ class ExcelProcessor:
             else:
                 split_candidates.append(download_row)
 
-        # Sort split_candidates by LINE SEQ for proper allocation order
-        split_candidates.sort(key=lambda row: row['LINE SEQ'])
+        # Keep quantity-priority order for split candidates to reduce number of split rows.
+        split_candidates.sort(key=lambda row: (-row['_quantity'], row['_orig_index']))
 
         for download_row in split_candidates:
             self._assign_split_download(download_row, factory_rows, result_rows)
@@ -306,44 +306,24 @@ class ExcelProcessor:
         result_rows: List[Dict[str, Any]]
     ) -> None:
         quantity_to_assign = download_row['_quantity']
-        combo = self._find_split_combo(download_row, factory_rows)
-        if combo is None:
-            # Unable to find combo, try group-based allocation
-            factory_groups = {}
-            for row in factory_rows:
-                if row['remaining_qty'] > 0:
-                    etd = row['ETD']
-                    if etd not in factory_groups:
-                        factory_groups[etd] = []
-                    factory_groups[etd].append(row)
-            
-            for etd, group in factory_groups.items():
-                if quantity_to_assign <= 0:
-                    break
-                group_total = sum(row['remaining_qty'] for row in group)
-                assign_qty = min(quantity_to_assign, group_total)
-                remaining_assign = assign_qty
-                for row in group:
-                    if remaining_assign <= 0:
-                        break
-                    qty = min(row['remaining_qty'], remaining_assign)
-                    self._assign_factory_segment(download_row, row, qty, result_rows)
-                    remaining_assign -= qty
-                quantity_to_assign -= assign_qty
-            
-            if quantity_to_assign > 0:
-                raise ValueError(
-                    f"Unable to fully map download row for PO#: {download_row['PO#']}, "
-                    f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
-                )
-            return
+        grouped_rows = self._find_split_group_combo(download_row, factory_rows)
+        if grouped_rows is None:
+            raise ValueError(
+                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
+                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
+            )
 
-        for factory_row in combo:
+        for group in grouped_rows:
             if quantity_to_assign <= 0:
                 break
-            assign_qty = min(factory_row['remaining_qty'], quantity_to_assign)
-            self._assign_factory_segment(download_row, factory_row, assign_qty, result_rows)
-            quantity_to_assign -= assign_qty
+            for factory_row in group:
+                if quantity_to_assign <= 0:
+                    break
+                assign_qty = min(factory_row['remaining_qty'], quantity_to_assign)
+                if assign_qty <= 0:
+                    continue
+                self._assign_factory_segment(download_row, factory_row, assign_qty, result_rows)
+                quantity_to_assign -= assign_qty
 
         if quantity_to_assign > 0:
             raise ValueError(
@@ -351,47 +331,62 @@ class ExcelProcessor:
                 f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
             )
 
-    def _find_split_combo(
+    def _find_split_group_combo(
         self,
         download_row: Dict[str, Any],
         factory_rows: List[Dict[str, Any]]
-    ) -> Optional[List[Dict[str, Any]]]:
+    ) -> Optional[List[List[Dict[str, Any]]]]:
         required_qty = download_row['_quantity']
         available = [row for row in factory_rows if row['remaining_qty'] > 0]
-        available.sort(key=lambda row: -row['remaining_qty'])
+        if not available:
+            return None
 
-        for combo_size in (2, 3):
-            best_combo = None
-            best_score = None
-            for combo in combinations(available, combo_size):
-                total_qty = sum(row['remaining_qty'] for row in combo)
-                if total_qty < required_qty:
-                    continue
-                assigned_qty = []
-                remaining = required_qty
-                same_etd_qty = 0.0
-                for row in combo:
-                    qty = min(row['remaining_qty'], remaining)
-                    assigned_qty.append(qty)
-                    if self._matches_etd(download_row, row):
-                        same_etd_qty += qty
-                    remaining -= qty
-                if remaining > 1e-9:
+        factory_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for row in available:
+            etd = str(row['ETD']).strip()
+            factory_groups.setdefault(etd, []).append(row)
+
+        group_items = []
+        for etd, rows in factory_groups.items():
+            sorted_rows = sorted(rows, key=lambda r: -r['remaining_qty'])
+            total_qty = sum(r['remaining_qty'] for r in sorted_rows)
+            group_items.append({
+                'etd': etd,
+                'rows': sorted_rows,
+                'total_qty': total_qty,
+                'same_etd': etd == str(download_row['ETD']).strip(),
+            })
+
+        group_items.sort(key=lambda g: -g['total_qty'])
+        max_groups = min(len(group_items), 4)
+
+        best_combo = None
+        best_score = None
+        for combo_size in range(2, max_groups + 1):
+            for combo in combinations(group_items, combo_size):
+                total_qty = sum(g['total_qty'] for g in combo)
+                if total_qty + 1e-9 < required_qty:
                     continue
 
+                same_etd_qty = sum(g['total_qty'] for g in combo if g['same_etd'])
+                surplus_qty = total_qty - required_qty
                 score = (
-                    sum(assigned_qty),
                     same_etd_qty,
-                    tuple(assigned_qty),
-                    tuple(row['remaining_qty'] for row in combo)
+                    max(g['total_qty'] for g in combo),
+                    combo_size,
+                    -surplus_qty,
                 )
                 if best_score is None or score > best_score:
                     best_score = score
                     best_combo = combo
-            if best_combo is not None:
-                return list(best_combo)
 
-        return None
+        if best_combo is None:
+            if sum(row['remaining_qty'] for row in available) + 1e-9 < required_qty:
+                return None
+            return [sorted(available, key=lambda r: -r['remaining_qty'])]
+
+        selected_groups = sorted(best_combo, key=lambda g: (not g['same_etd'], -g['total_qty']))
+        return [g['rows'] for g in selected_groups]
 
     def _generate_change_summary(self, original_pnet: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFrame:
         """Generate change summary comparing original and result."""

@@ -457,48 +457,39 @@ class ExcelProcessor:
         return pd.DataFrame(summary)
 
     def save_result(self, output_path: str) -> bool:
-        """Save result to Excel file with multiple sheets, clearing existing sheets first."""
+        """Save result by recreating workbook sheets with headers."""
         try:
             if self.result is None:
                 raise ValueError("No result to save. Run compare_and_generate first.")
 
-            # 기존 파일이 있으면 열고 모든 시트 클리어
-            try:
-                wb = openpyxl.load_workbook(output_path)
-                for sheet_name in wb.sheetnames:
-                    ws = wb[sheet_name]
-                    ws.delete_rows(1, ws.max_row)
-            except FileNotFoundError:
-                wb = openpyxl.Workbook()
-                # 기본 시트 제거
-                wb.remove(wb.active)
-
-            # 수동 업로드 sheet
+            # Always overwrite the workbook so all existing sheets are removed
+            # and new sheets are created with headers.
             column_order = [
                 'PO#', 'PO-LINE#', 'Material', 'CPO QTY', 'ETD(텍스트,YYYYMMDD)', 'EX-F(텍스트,YYYYMMDD)',
                 '내부노트', 'CPO#', 'CPO-LINE#', 'LINE SEQ'
             ]
-            ws_upload = wb.create_sheet('수동 업로드')
-            df_upload = self.result[column_order]
-            for r, row in enumerate(df_upload.itertuples(index=False), start=1):
-                for c, value in enumerate(row, start=1):
-                    ws_upload.cell(row=r, column=c, value=value)
 
-            # 확인필요 sheet
-            if self.confirmation_needed is not None and not self.confirmation_needed.empty:
-                ws_confirm = wb.create_sheet('확인필요')
-                for r, row in enumerate(self.confirmation_needed.itertuples(index=False), start=1):
-                    for c, value in enumerate(row, start=1):
-                        ws_confirm.cell(row=r, column=c, value=value)
+            confirmation_columns = ['PO#', 'PO-LINE#', '사유']
+            summary_columns = ['CPO#', 'CPO-LINE#', 'LINE SEQ', '변경종류']
 
-            # 변경요약 sheet
-            if self.change_summary is not None and not self.change_summary.empty:
-                ws_summary = wb.create_sheet('변경요약')
-                for r, row in enumerate(self.change_summary.itertuples(index=False), start=1):
-                    for c, value in enumerate(row, start=1):
-                        ws_summary.cell(row=r, column=c, value=value)
+            upload_df = self.result[column_order].copy()
+            if self.confirmation_needed is not None:
+                confirm_df = self.confirmation_needed.copy()
+            else:
+                confirm_df = pd.DataFrame(columns=confirmation_columns)
+            confirm_df = confirm_df.reindex(columns=confirmation_columns)
 
-            wb.save(output_path)
+            if self.change_summary is not None:
+                summary_df = self.change_summary.copy()
+            else:
+                summary_df = pd.DataFrame(columns=summary_columns)
+            summary_df = summary_df.reindex(columns=summary_columns)
+
+            with pd.ExcelWriter(output_path, engine='openpyxl', mode='w') as writer:
+                upload_df.to_excel(writer, sheet_name='수동 업로드', index=False)
+                confirm_df.to_excel(writer, sheet_name='확인필요', index=False)
+                summary_df.to_excel(writer, sheet_name='변경요약', index=False)
+
             return True
         except Exception as e:
             print(f"Error saving result: {e}")

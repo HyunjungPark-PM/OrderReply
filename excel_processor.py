@@ -305,10 +305,35 @@ class ExcelProcessor:
         quantity_to_assign = download_row['_quantity']
         combo = self._find_split_combo(download_row, factory_rows)
         if combo is None:
-            raise ValueError(
-                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
-                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
-            )
+            # Unable to find combo, try group-based allocation
+            factory_groups = {}
+            for row in factory_rows:
+                if row['remaining_qty'] > 0:
+                    etd = row['ETD']
+                    if etd not in factory_groups:
+                        factory_groups[etd] = []
+                    factory_groups[etd].append(row)
+            
+            for etd, group in factory_groups.items():
+                if quantity_to_assign <= 0:
+                    break
+                group_total = sum(row['remaining_qty'] for row in group)
+                assign_qty = min(quantity_to_assign, group_total)
+                remaining_assign = assign_qty
+                for row in group:
+                    if remaining_assign <= 0:
+                        break
+                    qty = min(row['remaining_qty'], remaining_assign)
+                    self._assign_factory_segment(download_row, row, qty, result_rows)
+                    remaining_assign -= qty
+                quantity_to_assign -= assign_qty
+            
+            if quantity_to_assign > 0:
+                raise ValueError(
+                    f"Unable to fully map download row for PO#: {download_row['PO#']}, "
+                    f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
+                )
+            return
 
         for factory_row in combo:
             if quantity_to_assign <= 0:

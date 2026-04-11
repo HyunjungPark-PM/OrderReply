@@ -243,11 +243,12 @@ class ExcelProcessor:
             else:
                 split_candidates.append(download_row)
 
-        # Keep quantity-priority order for split candidates to reduce number of split rows.
-        split_candidates.sort(key=lambda row: (-row['_quantity'], row['_orig_index']))
+        # Process smaller qty line first so they secure an ETD-group match;
+        # larger lines absorb the remaining split burden.
+        split_candidates.sort(key=lambda row: (row['_quantity'], row['_orig_index']))
 
         for download_row in split_candidates:
-            self._assign_split_download(download_row, factory_rows, result_rows)
+            self._assign_etd_grouped_split(download_row, factory_rows, result_rows)
 
         result_rows.sort(key=lambda row: (row['PO#'], row['PO-LINE#'], row['LINE SEQ']))
         return result_rows
@@ -299,94 +300,123 @@ class ExcelProcessor:
             'LINE SEQ': download_row['LINE SEQ']
         })
 
-    def _assign_split_download(
+    def _assign_etd_grouped_split(
         self,
         download_row: Dict[str, Any],
         factory_rows: List[Dict[str, Any]],
         result_rows: List[Dict[str, Any]]
     ) -> None:
-        quantity_to_assign = download_row['_quantity']
-        grouped_rows = self._find_split_group_combo(download_row, factory_rows)
-        if grouped_rows is None:
-            raise ValueError(
-                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
-                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
-            )
-
-        for group in grouped_rows:
-            if quantity_to_assign <= 0:
-                break
-            for factory_row in group:
-                if quantity_to_assign <= 0:
-                    break
-                assign_qty = min(factory_row['remaining_qty'], quantity_to_assign)
-                if assign_qty <= 0:
-                    continue
-                self._assign_factory_segment(download_row, factory_row, assign_qty, result_rows)
-                quantity_to_assign -= assign_qty
-
-        if quantity_to_assign > 0:
-            raise ValueError(
-                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
-                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
-            )
-
-    def _find_split_group_combo(
-        self,
-        download_row: Dict[str, Any],
-        factory_rows: List[Dict[str, Any]]
-    ) -> Optional[List[List[Dict[str, Any]]]]:
+        """Assign download_row using ETD-group aggregation.
+        Outputs ONE result row per ETD group used (not one per factory sub-row).
+        Finds the minimum number of ETD groups needed to cover the required qty.
+        """
         required_qty = download_row['_quantity']
-        available = [row for row in factory_rows if row['remaining_qty'] > 0]
-        if not available:
-            return None
+        download_etd = str(download_row['ETD']).strip()
 
-        factory_groups: Dict[str, List[Dict[str, Any]]] = {}
-        for row in available:
-            etd = str(row['ETD']).strip()
-            factory_groups.setdefault(etd, []).append(row)
+        # Build ETD groups from available factory rows
+        groups: Dict[str, Dict] = {}
+        for row in factory_rows:
+            if row['remaining_qty'] > 0:
+                etd = str(row['ETD']).strip()
+                if etd not in groups:
+                    groups[etd] = {
+                        'etd': etd,
+                        'rows': [],
+                        'total_qty': 0.0,
+                        'same_etd': etd == download_etd,
+                    }
+                groups[etd]['rows'].append(row)
+                groups[etd]['total_qty'] += row['remaining_qty']
 
-        group_items = []
-        for etd, rows in factory_groups.items():
-            sorted_rows = sorted(rows, key=lambda r: -r['remaining_qty'])
-            total_qty = sum(r['remaining_qty'] for r in sorted_rows)
-            group_items.append({
-                'etd': etd,
-                'rows': sorted_rows,
-                'total_qty': total_qty,
-                'same_etd': etd == str(download_row['ETD']).strip(),
+        if not groups:
+            raise ValueError(
+                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
+                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
+            )
+
+        # Sort rows within each group largest-first
+        for g in groups.values():
+            g['rows'].sort(key=lambda r: -r['remaining_qty'])
+
+        group_items = list(groups.values())
+        best_combo = self._find_best_etd_group_combo(required_qty, group_items)
+
+        if best_combo is None:
+            raise ValueError(
+                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
+                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
+            )
+
+        # Sort selected groups: same-ETD first, then by descending total_qty
+        selected = sorted(best_combo, key=lambda g: (not g['same_etd'], -g['total_qty']))
+
+        remaining = required_qty
+        for group in selected:
+            if remaining <= 1e-9:
+                break
+            take = min(group['total_qty'], remaining)
+            # Deduct from factory rows within the group
+            to_deduct = take
+            for row in group['rows']:
+                if to_deduct <= 1e-9:
+                    break
+                qty = min(row['remaining_qty'], to_deduct)
+                row['remaining_qty'] -= qty
+                to_deduct -= qty
+            # Primary row for Material/EX-F/내부노트
+            primary = group['rows'][0]
+            result_rows.append({
+                'PO#': download_row['PO#'],
+                'PO-LINE#': download_row['PO-LINE#'],
+                'Material': primary['Material'],
+                'CPO QTY': take,
+                'ETD(텍스트,YYYYMMDD)': group['etd'],
+                'EX-F(텍스트,YYYYMMDD)': primary['EX-F'],
+                '내부노트': primary.get('내부노트'),
+                'CPO#': download_row['CPO#'],
+                'CPO-LINE#': download_row['CPO-LINE#'],
+                'LINE SEQ': download_row['LINE SEQ']
             })
+            remaining -= take
 
-        group_items.sort(key=lambda g: -g['total_qty'])
-        max_groups = min(len(group_items), 4)
+        if remaining > 1e-9:
+            raise ValueError(
+                f"Unable to fully map download row for PO#: {download_row['PO#']}, "
+                f"PO-LINE#: {download_row['PO-LINE#']}, LINE SEQ: {download_row['LINE SEQ']}"
+            )
 
+    def _find_best_etd_group_combo(
+        self,
+        required_qty: float,
+        group_items: List[Dict[str, Any]]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Find the minimum number of ETD groups whose combined total covers required_qty.
+        Tie-break: prefer more same-ETD coverage, then larger primary group, then less surplus.
+        """
         best_combo = None
         best_score = None
-        for combo_size in range(2, max_groups + 1):
-            for combo in combinations(group_items, combo_size):
-                total_qty = sum(g['total_qty'] for g in combo)
-                if total_qty + 1e-9 < required_qty:
-                    continue
 
+        for combo_size in range(1, len(group_items) + 1):
+            for combo in combinations(group_items, combo_size):
+                total = sum(g['total_qty'] for g in combo)
+                if total + 1e-9 < required_qty:
+                    continue
                 same_etd_qty = sum(g['total_qty'] for g in combo if g['same_etd'])
-                surplus_qty = total_qty - required_qty
+                surplus = total - required_qty
                 score = (
-                    same_etd_qty,
-                    max(g['total_qty'] for g in combo),
-                    combo_size,
-                    -surplus_qty,
+                    -combo_size,          # fewer ETD groups is better
+                    same_etd_qty,         # more same-ETD coverage is better
+                    max(g['total_qty'] for g in combo),  # larger primary group is better
+                    -surplus,             # less waste is better
                 )
                 if best_score is None or score > best_score:
                     best_score = score
                     best_combo = combo
 
-        if best_combo is None:
-            if sum(row['remaining_qty'] for row in available) + 1e-9 < required_qty:
-                return None
-            return [sorted(available, key=lambda r: -r['remaining_qty'])]
+            if best_combo is not None:
+                break  # found minimum combo_size; no need to try larger
 
-        selected_groups = sorted(best_combo, key=lambda g: (not g['same_etd'], -g['total_qty']))
-        return [g['rows'] for g in selected_groups]
+        return list(best_combo) if best_combo else None
 
     def _generate_change_summary(self, original_pnet: pd.DataFrame, result_df: pd.DataFrame) -> pd.DataFrame:
         """Generate change summary comparing original and result."""

@@ -19,30 +19,37 @@ class ExcelProcessor:
         if pd.isna(date_val):
             return None
         
-        # Handle string input
         if isinstance(date_val, str):
             date_val = date_val.strip()
-            # Already in YYYYMMDD format
             if len(date_val) == 8 and date_val.isdigit():
                 return date_val
-            # Try parsing as datetime
             try:
                 parsed = pd.to_datetime(date_val)
                 return parsed.strftime('%Y%m%d')
             except:
                 return date_val
-        
-        # Handle numeric input (Excel serial or YYYYMMDD as int)
+
         try:
             num_val = int(float(date_val))
-            # If number is in YYYYMMDD format (8 digits, between 19000101 and 29991231)
             if 19000101 <= num_val <= 29991231 and len(str(num_val)) == 8:
                 return str(num_val)
-            # Otherwise treat as Excel serial number
             parsed = pd.to_datetime(num_val, unit='D', origin=pd.Timestamp("1899-12-30"))
             return parsed.strftime('%Y%m%d')
         except:
             return str(date_val)
+
+    def _normalize_date_for_change_summary(self, date_val):
+        """Normalize any date-like value to YYYYMMDD for comparison."""
+        if pd.isna(date_val):
+            return None
+        try:
+            normalized = pd.to_datetime(date_val)
+            return normalized.strftime('%Y%m%d')
+        except:
+            text = str(date_val).strip()
+            if len(text) == 8 and text.isdigit():
+                return text
+            return text
 
     def read_pnet_download(self, file_path: str) -> bool:
         """
@@ -192,38 +199,94 @@ class ExcelProcessor:
             return False
 
     def _try_global_no_split(self, pnet_group: pd.DataFrame, factory_group: pd.DataFrame) -> Optional[List[Dict[str, Any]]]:
-        """Try global no-split assignment."""
-        # Group factory by ETD
-        factory_by_etd = factory_group.groupby('ETD')
-        etd_requirements = {etd: group['CPO QTY'].sum() for etd, group in factory_by_etd}
+        """Try global no-split assignment by matching whole LINE SEQ rows to factory rows."""
+        pnet_rows = sorted(pnet_group.to_dict('records'), key=lambda row: -float(row['CPO QTY'] or 0))
+        factory_rows = [
+            {**row, 'remaining_qty': float(row['CPO QTY'] or 0)}
+            for row in factory_group.to_dict('records')
+        ]
 
-        # Find subsets of pnet LINE SEQ that match ETD requirements
-        pnet_rows = pnet_group.to_dict('records')
-        for etd, required_qty in etd_requirements.items():
-            matching_rows = [row for row in pnet_rows if row['ETD'] == etd and row['CPO QTY'] == required_qty]
-            if matching_rows:
-                # Assign
-                result = []
-                for row in matching_rows:
-                    factory_row = factory_group[factory_group['ETD'] == etd].iloc[0]  # Take first
-                    result.append({
-                        'PO#': row['PO#'],
-                        'PO-LINE#': row['PO-LINE#'],
-                        'Material': row['Material'],
-                        'CPO QTY': row['CPO QTY'],
-                        'ETD(텍스트,YYYYMMDD)': factory_row['ETD'],
-                        'EX-F(텍스트,YYYYMMDD)': factory_row['EX-F'],
-                        '내부노트': factory_row['내부노트'],
-                        'CPO#': row['CPO#'],
-                        'CPO-LINE#': row['CPO-LINE#'],
-                        'LINE SEQ': row['LINE SEQ']
-                    })
-                # Remove assigned
-                pnet_rows = [row for row in pnet_rows if row not in matching_rows]
-                if not pnet_rows:
-                    return result
+        assignment = self._find_no_split_assignment(pnet_rows, factory_rows)
+        if assignment is None:
+            return None
+
+        return [
+            {
+                'PO#': row['PO#'],
+                'PO-LINE#': row['PO-LINE#'],
+                'Material': row['Material'],
+                'CPO QTY': row['CPO QTY'],
+                'ETD(텍스트,YYYYMMDD)': row['factory_row']['ETD'],
+                'EX-F(텍스트,YYYYMMDD)': row['factory_row']['EX-F'],
+                '내부노트': row['factory_row']['내부노트'],
+                'CPO#': row['CPO#'],
+                'CPO-LINE#': row['CPO-LINE#'],
+                'LINE SEQ': row['LINE SEQ']
+            }
+            for row in assignment
+        ]
+
+    def _find_no_split_assignment(
+        self,
+        pnet_rows: List[Dict[str, Any]],
+        factory_rows: List[Dict[str, Any]],
+        index: int = 0
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Recursively assign whole pnet rows to factory rows without splitting."""
+        if index >= len(pnet_rows):
+            return []
+
+        pnet_row = pnet_rows[index]
+        for i, factory_row in enumerate(factory_rows):
+            if factory_row['remaining_qty'] >= float(pnet_row['CPO QTY'] or 0):
+                factory_row['remaining_qty'] -= float(pnet_row['CPO QTY'] or 0)
+                assigned = self._find_no_split_assignment(pnet_rows, factory_rows, index + 1)
+                if assigned is not None:
+                    return [
+                        {**pnet_row, 'factory_row': factory_row}
+                    ] + assigned
+                factory_row['remaining_qty'] += float(pnet_row['CPO QTY'] or 0)
         return None
+
     def _try_split_assignment(self, pnet_group: pd.DataFrame, factory_group: pd.DataFrame) -> Optional[List[Dict[str, Any]]]:
+        """Try split assignment with conditions."""
+        pnet_rows = sorted(pnet_group.to_dict('records'), key=lambda row: -float(row['CPO QTY'] or 0))
+        factory_rows = sorted(
+            [{**row, 'remaining_qty': float(row['CPO QTY'] or 0)} for row in factory_group.to_dict('records')],
+            key=lambda row: -row['remaining_qty']
+        )
+
+        pnet_total = sum(row['CPO QTY'] for row in pnet_rows)
+        factory_total = sum(row['remaining_qty'] for row in factory_rows)
+        if pnet_total < factory_total:
+            return None
+
+        result = []
+        factory_idx = 0
+        for pnet_row in pnet_rows:
+            qty_needed = float(pnet_row['CPO QTY'] or 0)
+            while qty_needed > 0 and factory_idx < len(factory_rows):
+                factory_row = factory_rows[factory_idx]
+                assign_qty = min(qty_needed, factory_row['remaining_qty'])
+                result.append({
+                    'PO#': pnet_row['PO#'],
+                    'PO-LINE#': pnet_row['PO-LINE#'],
+                    'Material': pnet_row['Material'],
+                    'CPO QTY': assign_qty,
+                    'ETD(텍스트,YYYYMMDD)': factory_row['ETD'],
+                    'EX-F(텍스트,YYYYMMDD)': factory_row['EX-F'],
+                    '내부노트': factory_row['내부노트'],
+                    'CPO#': pnet_row['CPO#'],
+                    'CPO-LINE#': pnet_row['CPO-LINE#'],
+                    'LINE SEQ': pnet_row['LINE SEQ']
+                })
+                qty_needed -= assign_qty
+                factory_row['remaining_qty'] -= assign_qty
+                if factory_row['remaining_qty'] <= 0:
+                    factory_idx += 1
+            if qty_needed > 0:
+                return None
+        return result
         """Try split assignment with conditions."""
         # Simplified split logic: allow splitting into 2-3 parts
         pnet_rows = pnet_group.to_dict('records')
@@ -283,8 +346,12 @@ class ExcelProcessor:
             changes = []
             if orig['CPO QTY'] != res['CPO QTY']:
                 changes.append(f'수량: {orig["CPO QTY"]} -> {res["CPO QTY"]}')
-            if orig['ETD'] != res['ETD(텍스트,YYYYMMDD)']:
-                changes.append(f'ETD: {orig["ETD"]} -> {res["ETD(텍스트,YYYYMMDD)"]}')
+
+            orig_etd = self._normalize_date_for_change_summary(orig['ETD'])
+            res_etd = self._normalize_date_for_change_summary(res['ETD(텍스트,YYYYMMDD)'])
+            if orig_etd != res_etd:
+                changes.append(f'ETD: {orig_etd} -> {res_etd}')
+
             if changes:
                 summary.append({
                     'CPO#': res['CPO#'],

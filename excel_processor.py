@@ -243,6 +243,9 @@ class ExcelProcessor:
             else:
                 split_candidates.append(download_row)
 
+        # Sort split_candidates by LINE SEQ for proper allocation order
+        split_candidates.sort(key=lambda row: row['LINE SEQ'])
+
         for download_row in split_candidates:
             self._assign_split_download(download_row, factory_rows, result_rows)
 

@@ -18,17 +18,29 @@ class ExcelProcessor:
         """Convert date to YYYYMMDD text format."""
         if pd.isna(date_val):
             return None
+        
+        # Handle string input
         if isinstance(date_val, str):
             date_val = date_val.strip()
+            # Already in YYYYMMDD format
             if len(date_val) == 8 and date_val.isdigit():
-                return date_val  # Already YYYYMMDD
+                return date_val
+            # Try parsing as datetime
             try:
                 parsed = pd.to_datetime(date_val)
                 return parsed.strftime('%Y%m%d')
             except:
                 return date_val
+        
+        # Handle numeric input (Excel serial or YYYYMMDD as int)
         try:
-            return pd.to_datetime(date_val).strftime('%Y%m%d')
+            num_val = int(float(date_val))
+            # If number is in YYYYMMDD format (8 digits, between 19000101 and 29991231)
+            if 19000101 <= num_val <= 29991231 and len(str(num_val)) == 8:
+                return str(num_val)
+            # Otherwise treat as Excel serial number
+            parsed = pd.to_datetime(num_val, unit='D', origin=pd.Timestamp("1899-12-30"))
+            return parsed.strftime('%Y%m%d')
         except:
             return str(date_val)
 
@@ -93,6 +105,9 @@ class ExcelProcessor:
             selected['CPO QTY'] = pd.to_numeric(selected['CPO QTY'], errors='coerce')
             selected['PO#'] = selected['PO#'].astype(str).str.strip()
             selected['LINE#'] = selected['LINE#'].astype(str).str.strip()
+            # Ensure ETD and EX-F are strings before date processing
+            selected['ETD'] = selected['ETD'].astype(str).str.strip()
+            selected['EX-F'] = selected['EX-F'].astype(str).str.strip()
             # Pad PO# to 10 digits
             selected['PO#'] = selected['PO#'].apply(lambda x: x.zfill(10) if len(x) == 9 else x)
             # Convert dates to YYYYMMDD text for comparison

@@ -185,6 +185,35 @@ class ExcelProcessor:
                     })
                     continue
 
+                # ETD-level distribution check:
+                # If PO# + PO-LINE# + ETD qty sums are identical between download and factory,
+                # output original download rows unchanged (no reassignment needed).
+                pnet_etd_dist = pnet_group.groupby('ETD')['CPO QTY'].sum().to_dict()
+                factory_etd_dist = factory_group.groupby('ETD')['CPO QTY'].sum().to_dict()
+                etd_dist_match = (
+                    set(pnet_etd_dist.keys()) == set(factory_etd_dist.keys()) and
+                    all(abs(pnet_etd_dist[etd] - factory_etd_dist.get(etd, 0)) < 1e-9
+                        for etd in pnet_etd_dist)
+                )
+                if etd_dist_match:
+                    for _, dl_row in pnet_group.iterrows():
+                        dl_etd = dl_row['ETD']
+                        matching_factory = factory_group[factory_group['ETD'] == dl_etd]
+                        frow = matching_factory.iloc[0] if not matching_factory.empty else factory_group.iloc[0]
+                        upload_result_list.append({
+                            'PO#': dl_row['PO#'],
+                            'PO-LINE#': dl_row['PO-LINE#'],
+                            'Material': frow['Material'],
+                            'CPO QTY': dl_row['CPO QTY'],
+                            'ETD(텍스트,YYYYMMDD)': dl_row['ETD'],
+                            'EX-F(텍스트,YYYYMMDD)': frow['EX-F'],
+                            '내부노트': frow['내부노트'],
+                            'CPO#': dl_row['CPO#'],
+                            'CPO-LINE#': dl_row['CPO-LINE#'],
+                            'LINE SEQ': dl_row['LINE SEQ']
+                        })
+                    continue
+
                 upload_result_list.extend(self._map_factory_to_download(pnet_group, factory_group))
 
             self.result = pd.DataFrame(upload_result_list)

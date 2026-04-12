@@ -81,15 +81,16 @@ class ExcelProcessor:
         - I: Material
         - O: EX-F (date YYYY-MM-DD)
         - P: ETD (date YYYY-MM-DD)
+        - R: 납품확정여부
         - X: PO# (9 or 10 digits, pad with 0 if 9)
         - Y: PO-LINE#
         """
         try:
             df = pd.read_excel(file_path, header=0, dtype=object)
-            selected = df.iloc[:, [4, 5, 6, 7, 8, 14, 15, 23, 24]].copy()
+            selected = df.iloc[:, [4, 5, 6, 7, 8, 14, 15, 17, 23, 24]].copy()
             selected.columns = [
                 'CPO#', 'CPO-LINE#', 'LINE SEQ', 'CPO QTY', 'Material',
-                'EX-F', 'ETD', 'PO#', 'PO-LINE#'
+                'EX-F', 'ETD', '납품확정여부', 'PO#', 'PO-LINE#'
             ]
             selected['CPO QTY'] = pd.to_numeric(selected['CPO QTY'], errors='coerce')
             selected['PO#'] = selected['PO#'].astype(str).str.strip()
@@ -97,6 +98,7 @@ class ExcelProcessor:
             selected['CPO#'] = selected['CPO#'].astype(str).str.strip()
             selected['CPO-LINE#'] = selected['CPO-LINE#'].astype(str).str.strip()
             selected['LINE SEQ'] = selected['LINE SEQ'].astype(str).str.strip()
+            selected['납품확정여부'] = selected['납품확정여부'].astype(str).str.strip()
             # Pad PO# to 10 digits
             selected['PO#'] = selected['PO#'].apply(lambda x: x.zfill(10) if len(x) == 9 else x)
             # Convert dates to YYYYMMDD text
@@ -217,7 +219,8 @@ class ExcelProcessor:
                             '내부노트': frow['내부노트'],
                             'CPO#': dl_row['CPO#'],
                             'CPO-LINE#': dl_row['CPO-LINE#'],
-                            'LINE SEQ': dl_row['LINE SEQ']
+                            'LINE SEQ': dl_row['LINE SEQ'],
+                            '납품확정여부': dl_row['납품확정여부']
                         })
                     continue
 
@@ -267,7 +270,8 @@ class ExcelProcessor:
                     '내부노트': None,
                     'CPO#': download_row['CPO#'],
                     'CPO-LINE#': download_row['CPO-LINE#'],
-                    'LINE SEQ': download_row['LINE SEQ']
+                    'LINE SEQ': download_row['LINE SEQ'],
+                    '납품확정여부': download_row['납품확정여부']
                 })
                 continue
 
@@ -333,7 +337,8 @@ class ExcelProcessor:
             '내부노트': factory_row['내부노트'],
             'CPO#': download_row['CPO#'],
             'CPO-LINE#': download_row['CPO-LINE#'],
-            'LINE SEQ': download_row['LINE SEQ']
+            'LINE SEQ': download_row['LINE SEQ'],
+            '납품확정여부': download_row['납품확정여부']
         })
 
     def _assign_etd_grouped_split(
@@ -411,7 +416,8 @@ class ExcelProcessor:
                 '내부노트': primary.get('내부노트'),
                 'CPO#': download_row['CPO#'],
                 'CPO-LINE#': download_row['CPO-LINE#'],
-                'LINE SEQ': download_row['LINE SEQ']
+                'LINE SEQ': download_row['LINE SEQ'],
+                '납품확정여부': download_row['납품확정여부']
             })
             remaining -= take
 
@@ -488,7 +494,8 @@ class ExcelProcessor:
                     'CPO#': res['CPO#'],
                     'CPO-LINE#': res['CPO-LINE#'],
                     'LINE SEQ': res['LINE SEQ'],
-                    '변경종류': '; '.join(changes)
+                    '변경종류': '; '.join(changes),
+                    '납품확정여부': res['납품확정여부']
                 })
         return pd.DataFrame(summary)
 
@@ -502,11 +509,11 @@ class ExcelProcessor:
             # and new sheets are created with headers.
             column_order = [
                 'PO#', 'PO-LINE#', 'Material', 'CPO QTY', 'ETD(텍스트,YYYYMMDD)', 'EX-F(텍스트,YYYYMMDD)',
-                '내부노트', 'CPO#', 'CPO-LINE#', 'LINE SEQ'
+                '내부노트', 'CPO#', 'CPO-LINE#', 'LINE SEQ', '납품확정여부'
             ]
 
             confirmation_columns = ['PO#', 'PO-LINE#', '사유']
-            summary_columns = ['CPO#', 'CPO-LINE#', 'LINE SEQ', '변경종류']
+            summary_columns = ['CPO#', 'CPO-LINE#', 'LINE SEQ', '변경종류', '납품확정여부']
 
             upload_df = self.result[column_order].copy()
             if self.confirmation_needed is not None:

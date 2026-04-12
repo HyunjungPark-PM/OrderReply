@@ -1,7 +1,7 @@
 import pandas as pd
 from itertools import combinations
 from typing import Any, List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, date
 import openpyxl
 
 
@@ -19,6 +19,13 @@ class ExcelProcessor:
         """Convert date to YYYYMMDD text format."""
         if pd.isna(date_val):
             return None
+
+        # Handle datetime-like objects first; Excel often yields datetime/Timestamp values.
+        if isinstance(date_val, (datetime, date, pd.Timestamp)):
+            try:
+                return pd.to_datetime(date_val).strftime('%Y%m%d')
+            except Exception:
+                return str(date_val)
         
         if isinstance(date_val, str):
             date_val = date_val.strip()

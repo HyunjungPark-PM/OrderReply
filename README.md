@@ -49,6 +49,7 @@ python main.py
 | I | Material |
 | O | EX-F |
 | P | ETD |
+| R | 납품확정여부 |
 | X | PO# |
 | Y | PO-LINE# |
 
@@ -76,6 +77,33 @@ python main.py
 | 8 | CPO# | CPO 번호 |
 | 9 | CPO-LINE# | CPO 라인 번호 |
 | 10 | LINE SEQ | 라인 시퀀스 |
+| 11 | 납품확정여부 | p-net 원본 R열 |
+
+## 코드 서명 안내
+
+- 실행파일 사용자 PC에서는 인증서 파일(`.pfx`)이 필요하지 않습니다.
+- 인증서는 개발/배포 시점에 실행파일(`.exe`)에 디지털 서명을 붙일 때만 필요합니다.
+- 사용자는 서명된 `exe`만 받아서 실행하면 됩니다.
+
+## 서명 릴리스 방법
+
+다음 스크립트가 준비되어 있습니다.
+
+- `sign_release.ps1`: build/dist exe 서명
+- `verify_signature.ps1`: 서명 상태 검증
+- `build_release_signed.ps1`: 빌드 + 서명 + 검증 + zip 생성
+
+저장소 인증서를 이용한 예시:
+
+```powershell
+.\build_release_signed.ps1 -Version 1.0.12 -StoreThumbprint 3F87D815085767D06BCD496D0BFB7D34605AEB73 -StoreScope CurrentUser -EnsureLocalTrust
+```
+
+간편 실행용 배치 파일도 사용할 수 있습니다.
+
+```bat
+build_release_signed.bat 1.0.12
+```
 
 ## 프로젝트 구조
 

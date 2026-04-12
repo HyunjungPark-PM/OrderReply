@@ -11,5 +11,17 @@ ENV/
 *.xlsx
 *.xls
 *.log
+~$*.xlsx
 Thumbs.db
 .DS_Store
+
+# Build artifacts
+build/
+build_v*/
+dist/
+dist_v*/
+*.spec.bak
+
+# Local scratch outputs
+__debug_result_newlogic.xlsx
+__save_result_test.xlsx
